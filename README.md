@@ -314,6 +314,15 @@ The `--type` option (on `history` and `search`):
 
 ---
 
+## 💻 System Requirements
+
+- **macOS** ≥ 26.3.1
+- **WeChat for Mac** ≤ 4.1.8.100
+
+> Older macOS versions or newer WeChat versions may not be compatible.
+
+---
+
 ## 🖥️ Platform Support
 
 | Platform | Status | Notes |
