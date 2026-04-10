@@ -34,14 +34,26 @@ def sessions(ctx, limit, fmt):
 
     names = get_contact_names(app.cache, app.decrypted_dir)
     with closing(sqlite3.connect(path)) as conn:
-        rows = conn.execute("""
-            SELECT username, unread_count, summary, last_timestamp,
-                   last_msg_type, last_msg_sender, last_sender_display_name
-            FROM SessionTable
-            WHERE last_timestamp > 0
-            ORDER BY last_timestamp DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
+        # 检测新版(SessionAbstract)还是旧版(SessionTable)
+        tables = [t[0] for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if 'SessionAbstract' in tables:
+            rows = conn.execute("""
+                SELECT m_nsUserName, m_uUnReadCount, '', m_uLastTime,
+                       0, '', ''
+                FROM SessionAbstract
+                WHERE m_uLastTime > 0
+                ORDER BY m_uLastTime DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT username, unread_count, summary, last_timestamp,
+                       last_msg_type, last_msg_sender, last_sender_display_name
+                FROM SessionTable
+                WHERE last_timestamp > 0
+                ORDER BY last_timestamp DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
 
     results = []
     for r in rows:

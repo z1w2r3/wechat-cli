@@ -13,12 +13,38 @@ class DBCache:
     CACHE_DIR = os.path.join(tempfile.gettempdir(), "wechat_cli_cache")
     MTIME_FILE = os.path.join(tempfile.gettempdir(), "wechat_cli_cache", "_mtimes.json")
 
+    # macOS 新版微信路径映射: CLI 期望路径 -> 实际相对路径
+    _MACOS_NEW_PATH_MAP = {
+        'session/session.db': '../Session/session_new.db',
+        'contact/contact.db': '../Contact/wccontact_new2.db',
+        'group/group.db': '../Group/group_new.db',
+        'favorite/favorite.db': '../Favorites/favorites.db',
+    }
+
     def __init__(self, all_keys, db_dir):
         self._all_keys = all_keys
         self._db_dir = db_dir
         self._cache = {}  # rel_key -> (db_mtime, wal_mtime, tmp_path)
         os.makedirs(self.CACHE_DIR, exist_ok=True)
+        self._detect_path_rewrites()
         self._load_persistent_cache()
+
+    def _detect_path_rewrites(self):
+        """检测 macOS 新版路径，构建重写表。"""
+        self._path_rewrites = {}
+        # message/message_N.db -> msg_N.db
+        import re, glob as glob_mod
+        for f in glob_mod.glob(os.path.join(self._db_dir, "msg_*.db")):
+            base = os.path.basename(f)
+            m = re.match(r'msg_(\d+)\.db', base)
+            if m:
+                old_key = f'message/message_{m.group(1)}.db'
+                self._path_rewrites[old_key] = base
+
+        for old_key, new_rel in self._MACOS_NEW_PATH_MAP.items():
+            real_path = os.path.normpath(os.path.join(self._db_dir, new_rel))
+            if os.path.exists(real_path):
+                self._path_rewrites[old_key] = new_rel
 
     def _cache_path(self, rel_key):
         h = hashlib.md5(rel_key.encode()).hexdigest()[:12]
@@ -36,7 +62,8 @@ class DBCache:
             tmp_path = info["path"]
             if not os.path.exists(tmp_path):
                 continue
-            rel_path = rel_key.replace('\\', os.sep)
+            actual_rel = self._path_rewrites.get(rel_key, rel_key)
+            rel_path = actual_rel.replace('\\', os.sep)
             db_path = os.path.join(self._db_dir, rel_path)
             wal_path = db_path + "-wal"
             try:
@@ -61,7 +88,9 @@ class DBCache:
         key_info = get_key_info(self._all_keys, rel_key)
         if not key_info:
             return None
-        rel_path = rel_key.replace('\\', '/').replace('/', os.sep)
+        # 应用路径重写（macOS 新版微信兼容）
+        actual_rel = self._path_rewrites.get(rel_key, rel_key)
+        rel_path = actual_rel.replace('\\', '/').replace('/', os.sep)
         db_path = os.path.join(self._db_dir, rel_path)
         wal_path = db_path + "-wal"
         if not os.path.exists(db_path):

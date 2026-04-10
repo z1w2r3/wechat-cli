@@ -37,22 +37,41 @@ MSG_TYPE_NAMES = list(MSG_TYPE_FILTERS.keys())
 # ---- 消息 DB 发现 ----
 
 def find_msg_db_keys(all_keys):
-    return sorted([
-        k for k in all_keys
-        if any(v.startswith("message/") for v in key_path_variants(k))
-        and any(re.search(r"message_\d+\.db$", v) for v in key_path_variants(k))
-    ])
+    found = []
+    for k in all_keys:
+        variants = key_path_variants(k)
+        # 旧版: message/message_N.db
+        if any(v.startswith("message/") for v in variants) and any(re.search(r"message_\d+\.db$", v) for v in variants):
+            found.append(k)
+        # 新版: msg_N.db
+        elif any(re.fullmatch(r"msg_\d+\.db", v) for v in variants):
+            found.append(k)
+    return sorted(found)
 
 
 def _is_safe_msg_table_name(table_name):
-    return bool(re.fullmatch(r'Msg_[0-9a-f]{32}', table_name))
+    return bool(re.fullmatch(r'(Msg|Chat)_[0-9a-f]{32}', table_name))
+
+
+# 新版微信列名映射
+_NEW_SCHEMA = False  # 运行时检测
+
+def _detect_table_for_user(username, conn):
+    """检测 Chat_ (新版) 或 Msg_ (旧版) 表。"""
+    table_hash = hashlib.md5(username.encode()).hexdigest()
+    for prefix in ('Chat_', 'Msg_'):
+        table_name = f"{prefix}{table_hash}"
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,)
+        ).fetchone()
+        if exists:
+            is_new = prefix == 'Chat_'
+            return table_name, is_new
+    return None, False
 
 
 def _find_msg_tables_for_user(username, msg_db_keys, cache):
-    table_hash = hashlib.md5(username.encode()).hexdigest()
-    table_name = f"Msg_{table_hash}"
-    if not _is_safe_msg_table_name(table_name):
-        return []
     matches = []
     for rel_key in msg_db_keys:
         path = cache.get(rel_key)
@@ -60,14 +79,12 @@ def _find_msg_tables_for_user(username, msg_db_keys, cache):
             continue
         conn = sqlite3.connect(path)
         try:
-            exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (table_name,)
-            ).fetchone()
-            if not exists:
+            table_name, is_new = _detect_table_for_user(username, conn)
+            if not table_name:
                 continue
-            max_ct = conn.execute(f"SELECT MAX(create_time) FROM [{table_name}]").fetchone()[0] or 0
-            matches.append({'db_path': path, 'table_name': table_name, 'max_create_time': max_ct})
+            time_col = 'msgCreateTime' if is_new else 'create_time'
+            max_ct = conn.execute(f"SELECT MAX({time_col}) FROM [{table_name}]").fetchone()[0] or 0
+            matches.append({'db_path': path, 'table_name': table_name, 'max_create_time': max_ct, 'is_new_schema': is_new})
         except Exception:
             pass
         finally:
@@ -222,26 +239,161 @@ def _format_voip_message_text(content):
     return f"[通话] {status_map.get(raw_text, raw_text)}"
 
 
-def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_username=None):
+def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_username=None, local_id=None):
     """尝试解析媒体文件在磁盘上的路径。
 
     Args:
-        db_dir: 微信 db_storage 目录
+        db_dir: 微信数据目录（db_storage 或 Message 所在目录）
         content: 解压后的 message_content
         local_type: 消息类型
         create_time_ts: 消息时间戳
         chat_username: 聊天对象 username（用于定位 attach 子目录）
+        local_id: 消息 local_id（用于 macOS 新版文件名匹配）
 
     Returns:
         (path, exists) 元组，path 为 None 表示无法解析
     """
     base_type = local_type & 0xFFFFFFFF
-    wechat_base = os.path.dirname(db_dir)
+
+    # 尝试多个可能的 wechat_base 目录
+    candidates = [os.path.dirname(db_dir), db_dir]
+    for wechat_base in candidates:
+        # 优先尝试 macOS 新版路径: Message/MessageTemp/<md5(username)>/
+        result = _resolve_media_path_macos_new(wechat_base, content, base_type, create_time_ts, chat_username, local_id)
+        if result[0] is not None:
+            return result
+
+    for wechat_base in candidates:
+        # Fallback: 旧版路径 msg/attach/
+        result = _resolve_media_path_legacy(wechat_base, content, base_type, create_time_ts, chat_username)
+        if result[0] is not None:
+            return result
+
+    return None, False
+
+
+def _resolve_media_path_macos_new(wechat_base, content, base_type, create_time_ts, chat_username, local_id):
+    """macOS 新版微信路径: Message/MessageTemp/<hash>/{Image,Audio,Video,File}/"""
+    msg_temp = os.path.join(wechat_base, "Message", "MessageTemp")
+    if not os.path.isdir(msg_temp):
+        return None, False
+
+    # 用 chat_username 的 MD5 定位子目录
+    chat_hash_dir = None
+    if chat_username:
+        h = hashlib.md5(chat_username.encode()).hexdigest()
+        candidate = os.path.join(msg_temp, h)
+        if os.path.isdir(candidate):
+            chat_hash_dir = candidate
+
+    if not chat_hash_dir:
+        return None, False
+
+    ts_str = str(int(create_time_ts)) if create_time_ts else ""
+    lid_str = str(int(local_id)) if local_id else ""
+
+    # 图片 (type 3): Image/{local_id}{timestamp}_.pic_thumb.jpg
+    if base_type == 3:
+        img_dir = os.path.join(chat_hash_dir, "Image")
+        if os.path.isdir(img_dir):
+            # 精确匹配: {local_id}{timestamp}_.pic_thumb.jpg
+            if lid_str and ts_str:
+                exact_name = f"{lid_str}{ts_str}_.pic_thumb.jpg"
+                exact_path = os.path.join(img_dir, exact_name)
+                if os.path.isfile(exact_path):
+                    return exact_path, True
+            # 模糊匹配: 用 timestamp 在文件名中搜索
+            if ts_str:
+                for f in os.listdir(img_dir):
+                    if ts_str in f and f.endswith(".jpg"):
+                        return os.path.join(img_dir, f), True
+        return None, False
+
+    # 语音 (type 34): Audio/*.aud.silk
+    if base_type == 34:
+        audio_dir = os.path.join(chat_hash_dir, "Audio")
+        if os.path.isdir(audio_dir):
+            silk_files = [f for f in os.listdir(audio_dir) if f.endswith(".aud.silk")]
+            if not silk_files:
+                return None, False
+            # 尝试从消息内容中提取 voiceid / clientmsgid 匹配文件名
+            if content:
+                root = _parse_xml_root(content)
+                if root is not None:
+                    # 提取 clientmsgid 或 voiceid
+                    for tag in ('clientmsgid', 'voiceid'):
+                        val = (root.findtext(f'.//{tag}') or '').strip()
+                        if val:
+                            for f in silk_files:
+                                if val in f or f.replace('.aud.silk', '') in val:
+                                    return os.path.join(audio_dir, f), True
+            # 无法精确匹配时，按修改时间找最近的
+            if ts_str:
+                best_file = None
+                best_diff = float('inf')
+                target_ts = int(create_time_ts)
+                for f in silk_files:
+                    fpath = os.path.join(audio_dir, f)
+                    try:
+                        mtime = int(os.path.getmtime(fpath))
+                        diff = abs(mtime - target_ts)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_file = fpath
+                    except OSError:
+                        continue
+                # 时间差在 60 秒以内认为匹配
+                if best_file and best_diff <= 60:
+                    return best_file, True
+        return None, False
+
+    # 视频 (type 43): Video/{local_id}_{timestamp}.mp4
+    if base_type == 43:
+        video_dir = os.path.join(chat_hash_dir, "Video")
+        if os.path.isdir(video_dir):
+            if lid_str and ts_str:
+                # 精确匹配
+                for suffix in ("", "_raw"):
+                    exact_name = f"{lid_str}_{ts_str}{suffix}.mp4"
+                    exact_path = os.path.join(video_dir, exact_name)
+                    if os.path.isfile(exact_path):
+                        return exact_path, True
+            # 模糊匹配
+            if ts_str:
+                for f in os.listdir(video_dir):
+                    if ts_str in f and f.endswith(".mp4") and "_raw" not in f:
+                        return os.path.join(video_dir, f), True
+        return None, False
+
+    # 文件 (type 49, sub 6): File/原始文件名
+    if base_type == 49 and content:
+        file_dir = os.path.join(chat_hash_dir, "File")
+        if os.path.isdir(file_dir):
+            root = _parse_xml_root(content)
+            if root is not None:
+                appmsg = root.find('.//appmsg')
+                if appmsg is not None:
+                    app_type = _parse_int((appmsg.findtext('type') or '').strip())
+                    if app_type == 6:
+                        title = (appmsg.findtext('title') or '').strip()
+                        if title:
+                            target = os.path.join(file_dir, title)
+                            if os.path.isfile(target):
+                                return target, True
+                            for f in os.listdir(file_dir):
+                                if title in f or f in title:
+                                    return os.path.join(file_dir, f), True
+        return None, False
+
+    return None, False
+
+
+def _resolve_media_path_legacy(wechat_base, content, base_type, create_time_ts, chat_username):
+    """旧版路径: msg/attach/<hash>/YYYY-MM/{Img,Voice,Video}/"""
     msg_dir = os.path.join(wechat_base, "msg")
     if not os.path.isdir(msg_dir):
         return None, False
 
-    from datetime import datetime
     dt = datetime.fromtimestamp(create_time_ts)
     date_prefix = dt.strftime("%Y-%m")
 
@@ -257,25 +409,20 @@ def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_userna
                     if title:
                         file_dir = os.path.join(msg_dir, "file", date_prefix)
                         if os.path.isdir(file_dir):
-                            # 精确匹配文件名
                             target = os.path.join(file_dir, title)
                             if os.path.isfile(target):
                                 return target, True
-                            # 模糊匹配（文件名可能有细微差异）
                             for f in os.listdir(file_dir):
                                 if title in f or f in title:
                                     return os.path.join(file_dir, f), True
         return None, False
 
-    # 图片消息 (type 3): msg/attach/<hash>/YYYY-MM/Img/*.dat
-    # 视频/语音消息: msg/video/YYYY-MM/ 或 msg/attach/
+    # 图片/语音/视频: msg/attach/<hash>/YYYY-MM/{Img,Voice,Video}/
     if base_type in (3, 34, 43):
-        # 搜索 attach 目录下对应月份的文件
         attach_dir = os.path.join(msg_dir, "attach")
         if not os.path.isdir(attach_dir):
             return None, False
 
-        # 尝试用 chat_username 的 MD5 匹配 attach 子目录
         target_hash = None
         if chat_username:
             h = hashlib.md5(chat_username.encode()).hexdigest()
@@ -283,7 +430,6 @@ def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_userna
             if os.path.isdir(candidate):
                 target_hash = h
 
-        # 限定搜索范围：目标目录或所有目录
         search_dirs = [target_hash] if target_hash else [
             d for d in os.listdir(attach_dir)
             if os.path.isdir(os.path.join(attach_dir, d))
@@ -296,11 +442,9 @@ def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_userna
             if os.path.isdir(sub):
                 files = [f for f in os.listdir(sub) if not f.endswith("_h.dat")]
                 if files:
-                    # 返回目录路径（具体是哪个文件无法从 XML 精确匹配）
                     sample = files[0]
                     return os.path.join(sub, sample), True
 
-        # 视频：也检查 msg/video/
         if base_type == 43:
             video_dir = os.path.join(msg_dir, "video", date_prefix)
             if os.path.isdir(video_dir):
@@ -320,7 +464,8 @@ def _format_message_text(local_id, local_type, content, is_group, chat_username,
     if resolve_media and db_dir and content:
         try:
             media_path, media_exists = _resolve_media_path(
-                db_dir, content, local_type, create_time_ts, chat_username
+                db_dir, content, local_type, create_time_ts, chat_username,
+                local_id=local_id
             )
         except Exception:
             pass
@@ -382,40 +527,58 @@ def _resolve_sender_label(real_sender_id, sender_from_content, is_group, chat_us
 
 # ---- SQL 查询 ----
 
-def _build_message_filters(start_ts=None, end_ts=None, keyword='', msg_type_filter=None):
+def _build_message_filters(start_ts=None, end_ts=None, keyword='', msg_type_filter=None, is_new_schema=False):
     clauses = []
     params = []
+    time_col = 'msgCreateTime' if is_new_schema else 'create_time'
+    content_col = 'msgContent' if is_new_schema else 'message_content'
+    type_col = 'messageType' if is_new_schema else 'local_type'
+
     if start_ts is not None:
-        clauses.append('create_time >= ?')
+        clauses.append(f'{time_col} >= ?')
         params.append(start_ts)
     if end_ts is not None:
-        clauses.append('create_time <= ?')
+        clauses.append(f'{time_col} <= ?')
         params.append(end_ts)
     if keyword:
-        clauses.append('message_content LIKE ?')
+        clauses.append(f'{content_col} LIKE ?')
         params.append(f'%{keyword}%')
     if msg_type_filter is not None:
         base_type = msg_type_filter[0]
-        clauses.append('(local_type & 0xFFFFFFFF) = ?')
-        params.append(base_type)
-        if len(msg_type_filter) > 1:
-            clauses.append('((local_type >> 32) & 0xFFFFFFFF) = ?')
-            params.append(msg_type_filter[1])
+        if is_new_schema:
+            clauses.append(f'{type_col} = ?')
+            params.append(base_type)
+        else:
+            clauses.append(f'({type_col} & 0xFFFFFFFF) = ?')
+            params.append(base_type)
+            if len(msg_type_filter) > 1:
+                clauses.append(f'(({type_col} >> 32) & 0xFFFFFFFF) = ?')
+                params.append(msg_type_filter[1])
     return clauses, params
 
 
-def _query_messages(conn, table_name, start_ts=None, end_ts=None, keyword='', limit=20, offset=0, msg_type_filter=None):
+def _query_messages(conn, table_name, start_ts=None, end_ts=None, keyword='', limit=20, offset=0, msg_type_filter=None, is_new_schema=False):
     if not _is_safe_msg_table_name(table_name):
         raise ValueError(f'非法消息表名: {table_name}')
-    clauses, params = _build_message_filters(start_ts, end_ts, keyword, msg_type_filter)
+    clauses, params = _build_message_filters(start_ts, end_ts, keyword, msg_type_filter, is_new_schema)
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ''
-    sql = f"""
-        SELECT local_id, local_type, create_time, real_sender_id, message_content,
-               WCDB_CT_message_content
-        FROM [{table_name}]
-        {where_sql}
-        ORDER BY create_time DESC
-    """
+
+    if is_new_schema:
+        # 新版: Chat_ 表, 返回格式与旧版对齐 (local_id, local_type, create_time, real_sender_id, content, ct, voice_text)
+        sql = f"""
+            SELECT mesLocalID, messageType, msgCreateTime, 0, msgContent, 0, msgVoiceText
+            FROM [{table_name}]
+            {where_sql}
+            ORDER BY msgCreateTime DESC
+        """
+    else:
+        sql = f"""
+            SELECT local_id, local_type, create_time, real_sender_id, message_content,
+                   WCDB_CT_message_content
+            FROM [{table_name}]
+            {where_sql}
+            ORDER BY create_time DESC
+        """
     if limit is None:
         return conn.execute(sql, params).fetchall()
     sql += "\n        LIMIT ? OFFSET ?"
@@ -482,6 +645,7 @@ def resolve_chat_context(chat_name, msg_db_keys, cache, decrypted_dir):
         'query': chat_name, 'username': username, 'display_name': display_name,
         'db_path': primary['db_path'], 'table_name': primary['table_name'],
         'message_tables': message_tables, 'is_group': '@chatroom' in username,
+        'is_new_schema': primary.get('is_new_schema', False),
     }
 
 
@@ -494,6 +658,7 @@ def _iter_table_contexts(ctx):
             'query': ctx['query'], 'username': ctx['username'], 'display_name': ctx['display_name'],
             'db_path': table['db_path'], 'table_name': table['table_name'],
             'is_group': ctx['is_group'],
+            'is_new_schema': table.get('is_new_schema', False),
         }
 
 
@@ -528,6 +693,112 @@ def _build_history_line(row, ctx, names, id_to_username, display_name_fn, resolv
     return create_time, f'[{time_str}] {text}'
 
 
+def _build_history_object(row, ctx, names, id_to_username, display_name_fn, resolve_media=False, db_dir=None, decode_voice=False, cfg=None):
+    """构建结构化消息 dict，用于 --json 输出。"""
+    # 新版表多一个 msgVoiceText 字段
+    if len(row) >= 7:
+        local_id, local_type, create_time, real_sender_id, content, ct, voice_text = row[:7]
+    else:
+        local_id, local_type, create_time, real_sender_id, content, ct = row
+        voice_text = None
+    content = decompress_content(content, ct)
+    if content is None:
+        content = '(无法解压)'
+
+    base_type, sub_type = _split_msg_type(local_type)
+    type_name = {
+        1: 'text', 3: 'image', 34: 'voice', 42: 'card',
+        43: 'video', 47: 'sticker', 48: 'location', 49: 'link',
+        50: 'call', 10000: 'system', 10002: 'revoke',
+    }.get(base_type, f'type_{base_type}')
+
+    # 文件消息特殊处理
+    if base_type == 49 and sub_type == 6:
+        type_name = 'file'
+
+    sender, text = _format_message_text(
+        local_id, local_type, content, ctx['is_group'], ctx['username'], ctx['display_name'], names, display_name_fn,
+        db_dir=db_dir, create_time_ts=create_time, resolve_media=resolve_media,
+    )
+    sender_label = _resolve_sender_label(
+        real_sender_id, sender, ctx['is_group'], ctx['username'], ctx['display_name'], names, id_to_username, display_name_fn
+    )
+
+    obj = {
+        'local_id': local_id,
+        'type': type_name,
+        'type_code': base_type,
+        'sender': sender_label or ctx['display_name'],
+        'timestamp': create_time,
+        'time': datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S'),
+        'text': text,
+    }
+
+    # 语音转文字（微信内置）
+    if voice_text and base_type == 34:
+        obj['voice_text'] = voice_text
+
+    # 解析媒体路径
+    if resolve_media and db_dir and content:
+        media = _build_media_info(
+            db_dir, content, local_type, create_time, ctx['username'], local_id,
+            base_type, sub_type, decode_voice, cfg
+        )
+        if media:
+            obj['media'] = media
+
+    return create_time, obj
+
+
+def _build_media_info(db_dir, content, local_type, create_time_ts, chat_username, local_id, base_type, sub_type, decode_voice, cfg):
+    """构建媒体信息 dict。"""
+    try:
+        media_path, media_exists = _resolve_media_path(
+            db_dir, content, local_type, create_time_ts, chat_username, local_id=local_id
+        )
+    except Exception:
+        return None
+
+    if not media_path:
+        return None
+
+    media = {'path': media_path, 'exists': media_exists}
+
+    # 图片
+    if base_type == 3:
+        media['type'] = 'image'
+
+    # 语音: 可选转码
+    elif base_type == 34:
+        media['type'] = 'voice'
+        media['original'] = media_path
+        if decode_voice and media_exists and cfg:
+            from .voice import decode_silk_to_wav
+            wav_path, warning = decode_silk_to_wav(media_path, cfg)
+            if wav_path:
+                media['decoded'] = wav_path
+            if warning:
+                media['decode_warning'] = warning
+
+    # 视频
+    elif base_type == 43:
+        media['type'] = 'video'
+
+    # 文件
+    elif base_type == 49 and sub_type == 6:
+        media['type'] = 'file'
+        # 提取原始文件名
+        root = _parse_xml_root(content)
+        if root is not None:
+            appmsg = root.find('.//appmsg')
+            if appmsg is not None:
+                title = (appmsg.findtext('title') or '').strip()
+                if title:
+                    media['filename'] = title
+
+    return media
+
+
 def _build_search_entry(row, ctx, names, id_to_username, display_name_fn, resolve_media=False, db_dir=None):
     local_id, local_type, create_time, real_sender_id, content, ct = row
     content = decompress_content(content, ct)
@@ -552,26 +823,32 @@ def _build_search_entry(row, ctx, names, id_to_username, display_name_fn, resolv
 
 # ---- 聊天记录查询 ----
 
-def collect_chat_history(ctx, names, display_name_fn, start_ts=None, end_ts=None, limit=20, offset=0, msg_type_filter=None, resolve_media=False, db_dir=None):
+def collect_chat_history(ctx, names, display_name_fn, start_ts=None, end_ts=None, limit=20, offset=0, msg_type_filter=None, resolve_media=False, db_dir=None, structured=False, decode_voice=False, cfg=None):
     collected = []
     failures = []
     candidate_limit = _candidate_page_size(limit, offset)
     batch_size = min(candidate_limit, _HISTORY_QUERY_BATCH_SIZE)
 
+    builder = _build_history_object if structured else _build_history_line
+    builder_kwargs = dict(resolve_media=resolve_media, db_dir=db_dir)
+    if structured:
+        builder_kwargs.update(decode_voice=decode_voice, cfg=cfg)
+
     for table_ctx in _iter_table_contexts(ctx):
         try:
+            is_new = table_ctx.get('is_new_schema', False)
             with closing(sqlite3.connect(table_ctx['db_path'])) as conn:
-                id_to_username = _load_name2id_maps(conn)
+                id_to_username = {} if is_new else _load_name2id_maps(conn)
                 fetch_offset = 0
                 before = len(collected)
                 while len(collected) - before < candidate_limit:
-                    rows = _query_messages(conn, table_ctx['table_name'], start_ts=start_ts, end_ts=end_ts, limit=batch_size, offset=fetch_offset, msg_type_filter=msg_type_filter)
+                    rows = _query_messages(conn, table_ctx['table_name'], start_ts=start_ts, end_ts=end_ts, limit=batch_size, offset=fetch_offset, msg_type_filter=msg_type_filter, is_new_schema=is_new)
                     if not rows:
                         break
                     fetch_offset += len(rows)
                     for row in rows:
                         try:
-                            collected.append(_build_history_line(row, table_ctx, names, id_to_username, display_name_fn, resolve_media=resolve_media, db_dir=db_dir))
+                            collected.append(builder(row, table_ctx, names, id_to_username, display_name_fn, **builder_kwargs))
                         except Exception as e:
                             failures.append(f"local_id={row[0]}: {e}")
                         if len(collected) - before >= candidate_limit:
@@ -582,7 +859,7 @@ def collect_chat_history(ctx, names, display_name_fn, start_ts=None, end_ts=None
             failures.append(f"{table_ctx['db_path']}: {e}")
 
     paged = _page_ranked_entries(collected, limit, offset)
-    return [line for _, line in paged], failures
+    return [item for _, item in paged], failures
 
 
 # ---- 搜索查询 ----

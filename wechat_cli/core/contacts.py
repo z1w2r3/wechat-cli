@@ -15,7 +15,15 @@ def _load_contacts_from(db_path):
     full = []
     conn = sqlite3.connect(db_path)
     try:
-        for r in conn.execute("SELECT username, nick_name, remark FROM contact").fetchall():
+        # 检测新版(WCContact)还是旧版(contact)表
+        tables = [t[0] for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if 'WCContact' in tables:
+            sql = "SELECT m_nsUsrName, nickname, m_nsRemark FROM WCContact"
+        elif 'contact' in tables:
+            sql = "SELECT username, nick_name, remark FROM contact"
+        else:
+            return names, full
+        for r in conn.execute(sql).fetchall():
             uname, nick, remark = r
             display = remark if remark else nick if nick else uname
             names[uname] = display

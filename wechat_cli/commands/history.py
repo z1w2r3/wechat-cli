@@ -23,8 +23,10 @@ from ..output.formatter import output
 @click.option("--format", "fmt", default="json", type=click.Choice(["json", "text"]), help="输出格式")
 @click.option("--type", "msg_type", default=None, type=click.Choice(MSG_TYPE_NAMES), help="消息类型过滤")
 @click.option("--media", is_flag=True, help="解析媒体文件路径（图片/文件/视频/语音）")
+@click.option("--decode-voice", is_flag=True, help="将语音 silk 文件转码为 wav（需要 pilk + ffmpeg）")
+@click.option("--json", "structured_json", is_flag=True, help="输出结构化 JSON（每条消息为独立对象，含媒体信息）")
 @click.pass_context
-def history(ctx, chat_name, limit, offset, start_time, end_time, fmt, msg_type, media):
+def history(ctx, chat_name, limit, offset, start_time, end_time, fmt, msg_type, media, decode_voice, structured_json):
     """获取指定聊天的消息记录
 
     \b
@@ -33,8 +35,16 @@ def history(ctx, chat_name, limit, offset, start_time, end_time, fmt, msg_type, 
       wechat-cli history "张三" --limit 100 --offset 50  # 分页查询
       wechat-cli history "AI交流群" --start-time "2026-04-01" --end-time "2026-04-02"
       wechat-cli history "张三" --format text             # 纯文本输出
+      wechat-cli history "AI交流群" --media --decode-voice --json  # Agent 友好的结构化输出
     """
     app = ctx.obj
+
+    # --json 隐含 --media
+    if structured_json:
+        media = True
+    # --decode-voice 隐含 --media
+    if decode_voice:
+        media = True
 
     try:
         validate_pagination(limit, offset, limit_max=None)
@@ -53,35 +63,50 @@ def history(ctx, chat_name, limit, offset, start_time, end_time, fmt, msg_type, 
 
     names = get_contact_names(app.cache, app.decrypted_dir)
     type_filter = MSG_TYPE_FILTERS[msg_type] if msg_type else None
-    lines, failures = collect_chat_history(
+    items, failures = collect_chat_history(
         chat_ctx, names, app.display_name_fn,
         start_ts=start_ts, end_ts=end_ts, limit=limit, offset=offset,
         msg_type_filter=type_filter, resolve_media=media, db_dir=app.db_dir,
+        structured=structured_json, decode_voice=decode_voice, cfg=app.cfg,
     )
 
-    if fmt == 'json':
+    if structured_json:
         output({
             'chat': chat_ctx['display_name'],
             'username': chat_ctx['username'],
             'is_group': chat_ctx['is_group'],
-            'count': len(lines),
+            'count': len(items),
             'offset': offset,
             'limit': limit,
             'start_time': start_time or None,
             'end_time': end_time or None,
             'type': msg_type or None,
-            'messages': lines,
+            'messages': items,
+            'failures': failures if failures else None,
+        }, 'json')
+    elif fmt == 'json':
+        output({
+            'chat': chat_ctx['display_name'],
+            'username': chat_ctx['username'],
+            'is_group': chat_ctx['is_group'],
+            'count': len(items),
+            'offset': offset,
+            'limit': limit,
+            'start_time': start_time or None,
+            'end_time': end_time or None,
+            'type': msg_type or None,
+            'messages': items,
             'failures': failures if failures else None,
         }, 'json')
     else:
-        header = f"{chat_ctx['display_name']} 的消息记录（返回 {len(lines)} 条，offset={offset}, limit={limit}）"
+        header = f"{chat_ctx['display_name']} 的消息记录（返回 {len(items)} 条，offset={offset}, limit={limit}）"
         if chat_ctx['is_group']:
             header += " [群聊]"
         if start_time or end_time:
             header += f"\n时间范围: {start_time or '最早'} ~ {end_time or '最新'}"
         if failures:
             header += "\n查询失败: " + "；".join(failures)
-        if lines:
-            output(header + ":\n\n" + "\n".join(lines), 'text')
+        if items:
+            output(header + ":\n\n" + "\n".join(items), 'text')
         else:
             output(f"{chat_ctx['display_name']} 无消息记录", 'text')
