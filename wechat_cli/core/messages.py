@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import struct
 import xml.etree.ElementTree as ET
 from contextlib import closing
 from datetime import datetime
@@ -292,16 +293,17 @@ def _resolve_media_path_macos_new(wechat_base, content, base_type, create_time_t
     ts_str = str(int(create_time_ts)) if create_time_ts else ""
     lid_str = str(int(local_id)) if local_id else ""
 
-    # 图片 (type 3): Image/{local_id}{timestamp}_.pic_thumb.jpg
+    # 图片 (type 3): Image/{local_id}{timestamp}_.pic.jpg 或 _.pic_thumb.jpg
     if base_type == 3:
         img_dir = os.path.join(chat_hash_dir, "Image")
         if os.path.isdir(img_dir):
-            # 精确匹配: {local_id}{timestamp}_.pic_thumb.jpg
             if lid_str and ts_str:
-                exact_name = f"{lid_str}{ts_str}_.pic_thumb.jpg"
-                exact_path = os.path.join(img_dir, exact_name)
-                if os.path.isfile(exact_path):
-                    return exact_path, True
+                # 优先完整图，fallback 缩略图
+                for suffix in ("_.pic.jpg", "_.pic_thumb.jpg"):
+                    exact_name = f"{lid_str}{ts_str}{suffix}"
+                    exact_path = os.path.join(img_dir, exact_name)
+                    if os.path.isfile(exact_path):
+                        return exact_path, True
             # 模糊匹配: 用 timestamp 在文件名中搜索
             if ts_str:
                 for f in os.listdir(img_dir):
@@ -347,21 +349,30 @@ def _resolve_media_path_macos_new(wechat_base, content, base_type, create_time_t
                     return best_file, True
         return None, False
 
-    # 视频 (type 43): Video/{local_id}_{timestamp}.mp4
+    # 视频 (type 43): Video/{local_id}_{timestamp}.mp4 或缩略图
     if base_type == 43:
         video_dir = os.path.join(chat_hash_dir, "Video")
         if os.path.isdir(video_dir):
             if lid_str and ts_str:
-                # 精确匹配
+                # 精确匹配 mp4
                 for suffix in ("", "_raw"):
                     exact_name = f"{lid_str}_{ts_str}{suffix}.mp4"
                     exact_path = os.path.join(video_dir, exact_name)
                     if os.path.isfile(exact_path):
                         return exact_path, True
+                # mp4 不存在，返回缩略图
+                thumb_name = f"{lid_str}_{ts_str}.video_thumb.jpg"
+                thumb_path = os.path.join(video_dir, thumb_name)
+                if os.path.isfile(thumb_path):
+                    return thumb_path, True
             # 模糊匹配
             if ts_str:
                 for f in os.listdir(video_dir):
                     if ts_str in f and f.endswith(".mp4") and "_raw" not in f:
+                        return os.path.join(video_dir, f), True
+                # 缩略图 fallback
+                for f in os.listdir(video_dir):
+                    if ts_str in f and f.endswith("_thumb.jpg"):
                         return os.path.join(video_dir, f), True
         return None, False
 
@@ -444,6 +455,144 @@ def _resolve_image_dat_name(content):
     if not md5_val:
         return None
     return _hardlink_md5_cache.get(md5_val) if _hardlink_md5_cache else None
+
+
+# ---------------------------------------------------------------------------
+# DAT 图片解密 (参考 wechat-decrypt/decode_image.py)
+# ---------------------------------------------------------------------------
+
+_V2_MAGIC = b'\x07\x08\x56\x32'          # 前 4 字节快速检测
+_V2_MAGIC_FULL = b'\x07\x08V2\x08\x07'   # 完整 6 字节签名
+_V1_MAGIC_FULL = b'\x07\x08V1\x08\x07'
+
+_IMAGE_MAGIC = {
+    'png': [0x89, 0x50, 0x4E, 0x47],
+    'gif': [0x47, 0x49, 0x46, 0x38],
+    'tif': [0x49, 0x49, 0x2A, 0x00],
+    'webp': [0x52, 0x49, 0x46, 0x46],
+    'jpg': [0xFF, 0xD8, 0xFF],
+}
+
+
+def _detect_xor_key(header):
+    """通过对比文件头和已知图片 magic bytes 自动检测单字节 XOR key。"""
+    if len(header) < 4 or header[:4] == _V2_MAGIC:
+        return None
+    for _fmt, magic in _IMAGE_MAGIC.items():
+        key = header[0] ^ magic[0]
+        if all((header[i] ^ key) == magic[i] for i in range(1, min(len(magic), len(header)))):
+            return key
+    # BMP (2 字节 magic，需额外验证)
+    bmp_key = header[0] ^ 0x42
+    if len(header) >= 14 and (header[1] ^ bmp_key) == 0x4D:
+        dec = bytes(b ^ bmp_key for b in header[:14])
+        bmp_size = struct.unpack_from('<I', dec, 2)[0]
+        bmp_offset = struct.unpack_from('<I', dec, 10)[0]
+        if 14 <= bmp_offset <= 1078 and bmp_size < 200_000_000:
+            return bmp_key
+    return None
+
+
+def _detect_image_format(header):
+    if header[:3] == b'\xFF\xD8\xFF':
+        return 'jpg'
+    if header[:4] == b'\x89PNG':
+        return 'png'
+    if header[:3] == b'GIF':
+        return 'gif'
+    if header[:2] == b'BM':
+        return 'bmp'
+    if header[:4] == b'RIFF' and len(header) >= 12 and header[8:12] == b'WEBP':
+        return 'webp'
+    if header[:4] == b'\x49\x49\x2A\x00':
+        return 'tif'
+    return 'bin'
+
+
+def decode_dat_image(dat_path, out_dir=None):
+    """解密 .dat 图片文件，返回 (decoded_path, fmt) 或 (None, None)。
+
+    支持: 旧版单字节 XOR / V1 (固定 AES key) / V2 (需 pycryptodome)。
+    解码后文件缓存到 out_dir（默认与 dat 同目录）。
+    """
+    if not os.path.isfile(dat_path):
+        return None, None
+
+    with open(dat_path, 'rb') as f:
+        head = f.read(16)
+
+    if len(head) < 4:
+        return None, None
+
+    sig6 = head[:6]
+
+    # ---------- V1 / V2 格式 ----------
+    if sig6 in (_V1_MAGIC_FULL, _V2_MAGIC_FULL):
+        if sig6 == _V1_MAGIC_FULL:
+            aes_key = b'cfcd208495d565ef'  # md5("0")[:16]
+        else:
+            # V2 需要从进程内存提取 key，这里暂不支持
+            return None, None
+        try:
+            from Crypto.Cipher import AES
+            from Crypto.Util import Padding
+        except ImportError:
+            return None, None
+
+        with open(dat_path, 'rb') as f:
+            data = f.read()
+        if len(data) < 15:
+            return None, None
+
+        aes_size, xor_size = struct.unpack_from('<LL', data, 6)
+        aligned = aes_size - (~(~aes_size % 16))  # 向上对齐到 16
+        offset = 15
+        if offset + aligned > len(data):
+            return None, None
+
+        try:
+            cipher = AES.new(aes_key[:16], AES.MODE_ECB)
+            dec_aes = Padding.unpad(cipher.decrypt(data[offset:offset + aligned]), AES.block_size)
+        except (ValueError, KeyError):
+            return None, None
+        offset += aligned
+
+        raw_end = len(data) - xor_size
+        raw_data = data[offset:raw_end] if offset < raw_end else b''
+        dec_xor = bytes(b ^ 0x88 for b in data[raw_end:])
+        decrypted = dec_aes + raw_data + dec_xor
+
+    # ---------- 旧版单字节 XOR ----------
+    else:
+        key = _detect_xor_key(head)
+        if key is None:
+            return None, None
+        with open(dat_path, 'rb') as f:
+            data = f.read()
+        decrypted = bytes(b ^ key for b in data)
+
+    fmt = _detect_image_format(decrypted[:16])
+    if fmt == 'bin':
+        return None, None
+
+    # 输出路径
+    base_name = os.path.splitext(os.path.basename(dat_path))[0]
+    for suffix in ('_t', '_h'):
+        if base_name.endswith(suffix):
+            base_name = base_name[:-len(suffix)]
+            break
+    if out_dir is None:
+        out_dir = os.path.dirname(dat_path)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{base_name}.{fmt}")
+
+    # 已有缓存直接返回
+    if os.path.isfile(out_path):
+        return out_path, fmt
+
+    with open(out_path, 'wb') as f:
+        f.write(decrypted)
+    return out_path, fmt
 
 
 def _resolve_media_path_legacy(wechat_base, content, base_type, create_time_ts, chat_username):
@@ -830,9 +979,19 @@ def _build_history_object(row, ctx, names, id_to_username, display_name_fn, reso
         50: 'call', 10000: 'system', 10002: 'revoke',
     }.get(base_type, f'type_{base_type}')
 
-    # 文件消息特殊处理
-    if base_type == 49 and sub_type == 6:
-        type_name = 'file'
+    # 文件消息特殊处理: sub_type==6 或从 XML 中提取 app_type==6
+    if base_type == 49:
+        if sub_type == 6:
+            type_name = 'file'
+        elif content and '<appmsg' in content:
+            root = _parse_xml_root(content)
+            if root is not None:
+                appmsg = root.find('.//appmsg')
+                if appmsg is not None:
+                    app_type = _parse_int((appmsg.findtext('type') or '').strip())
+                    if app_type == 6:
+                        type_name = 'file'
+                        sub_type = 6
 
     sender, text = _format_message_text(
         local_id, local_type, content, ctx['is_group'], ctx['username'], ctx['display_name'], names, display_name_fn,
@@ -905,9 +1064,17 @@ def _build_media_info(db_dir, content, local_type, create_time_ts, chat_username
 
     media = {'path': media_path, 'exists': media_exists}
 
-    # 图片
+    # 图片: 如果是 .dat 文件则尝试解码
     if base_type == 3:
         media['type'] = 'image'
+        if media_path and media_exists and media_path.endswith('.dat'):
+            decoded_dir = cfg.get('decoded_image_dir') if cfg else None
+            decoded_path, img_fmt = decode_dat_image(media_path, out_dir=decoded_dir)
+            if decoded_path:
+                media['decoded'] = decoded_path
+                media['original'] = media_path
+                media['path'] = decoded_path
+                media['format'] = img_fmt
 
     # 视频
     elif base_type == 43:
