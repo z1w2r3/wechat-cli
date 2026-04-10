@@ -388,6 +388,64 @@ def _resolve_media_path_macos_new(wechat_base, content, base_type, create_time_t
     return None, False
 
 
+_hardlink_md5_cache = None
+
+
+def _load_hardlink_cache(cache=None):
+    """加载 hardlink DB 的 md5 → file_name 映射。"""
+    global _hardlink_md5_cache
+    if _hardlink_md5_cache is not None:
+        return _hardlink_md5_cache
+    _hardlink_md5_cache = {}
+
+    hl_path = None
+    # 通过 DBCache 解密 hardlink DB
+    if cache:
+        hl_path = cache.get("hardlink/hardlink.db")
+
+    if not hl_path:
+        # fallback: 搜索已解密的缓存文件
+        import tempfile, glob as glob_mod
+        cache_dir = os.path.join(tempfile.gettempdir(), "wechat_cli_cache")
+        for f in glob_mod.glob(os.path.join(cache_dir, "*.db")):
+            try:
+                conn = sqlite3.connect(f)
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='image_hardlink_info_v4'").fetchone():
+                    hl_path = f
+                    conn.close()
+                    break
+                conn.close()
+            except Exception:
+                pass
+
+    if hl_path:
+        try:
+            conn = sqlite3.connect(hl_path)
+            for row in conn.execute("SELECT md5, file_name FROM image_hardlink_info_v4"):
+                _hardlink_md5_cache[row[0]] = row[1]
+            conn.close()
+        except Exception:
+            pass
+
+    return _hardlink_md5_cache
+
+
+def _resolve_image_dat_name(content):
+    """从消息 XML 的 md5 字段，通过 hardlink DB 查找对应的 dat 文件名。"""
+    root = _parse_xml_root(content)
+    if root is None:
+        return None
+    img = root.find('.//img')
+    if img is None:
+        return None
+    md5_val = (img.get('md5') or '').strip()
+    if not md5_val:
+        md5_val = (img.get('cdnthumbmd5') or '').strip()
+    if not md5_val:
+        return None
+    return _hardlink_md5_cache.get(md5_val) if _hardlink_md5_cache else None
+
+
 def _resolve_media_path_legacy(wechat_base, content, base_type, create_time_ts, chat_username):
     """旧版路径: msg/attach/<hash>/YYYY-MM/{Img,Voice,Video}/"""
     msg_dir = os.path.join(wechat_base, "msg")
@@ -437,8 +495,22 @@ def _resolve_media_path_legacy(wechat_base, content, base_type, create_time_ts, 
 
         sub_dir_name = "Img" if base_type == 3 else ("Video" if base_type == 43 else "Voice")
 
-        # temp/ImageUtils/ 下有微信解码好的 jpg（hash 和 dat 文件名一致）
-        image_utils_dir = os.path.join(wechat_base, "temp", "ImageUtils")
+        # 图片: 用消息 XML 中的 md5 通过 hardlink DB 精确匹配 dat 文件名
+        if base_type == 3 and content:
+            dat_name = _resolve_image_dat_name(content)
+            if dat_name:
+                image_utils_dir = os.path.join(wechat_base, "temp", "ImageUtils")
+                dat_hash = dat_name.replace('.dat', '')
+                # 优先返回 temp/ImageUtils/ 下的解码 jpg
+                if os.path.isdir(image_utils_dir):
+                    jpg_path = os.path.join(image_utils_dir, dat_hash + ".jpg")
+                    if os.path.isfile(jpg_path):
+                        return jpg_path, True
+                # 在 attach 目录下找 dat 文件
+                for d in search_dirs:
+                    dat_path = os.path.join(attach_dir, d, date_prefix, "Img", dat_name)
+                    if os.path.isfile(dat_path):
+                        return dat_path, True
 
         for d in search_dirs:
             sub = os.path.join(attach_dir, d, date_prefix, sub_dir_name)
@@ -447,14 +519,7 @@ def _resolve_media_path_legacy(wechat_base, content, base_type, create_time_ts, 
                 if not files:
                     files = [f for f in os.listdir(sub) if not f.endswith("_h.dat")]
                 if files:
-                    dat_file = files[0]
-                    # 图片: 优先返回 temp/ImageUtils/ 下的解码 jpg
-                    if base_type == 3 and os.path.isdir(image_utils_dir):
-                        dat_hash = dat_file.replace('.dat', '').replace('_t', '')
-                        jpg_path = os.path.join(image_utils_dir, dat_hash + ".jpg")
-                        if os.path.isfile(jpg_path):
-                            return jpg_path, True
-                    return os.path.join(sub, dat_file), True
+                    return os.path.join(sub, files[0]), True
 
         if base_type == 43:
             video_dir = os.path.join(msg_dir, "video", date_prefix)
@@ -887,6 +952,8 @@ def _build_search_entry(row, ctx, names, id_to_username, display_name_fn, resolv
 # ---- 聊天记录查询 ----
 
 def collect_chat_history(ctx, names, display_name_fn, start_ts=None, end_ts=None, limit=20, offset=0, msg_type_filter=None, resolve_media=False, db_dir=None, structured=False, decode_voice=False, cfg=None, cache=None):
+    if resolve_media and cache:
+        _load_hardlink_cache(cache)
     collected = []
     failures = []
     candidate_limit = _candidate_page_size(limit, offset)
