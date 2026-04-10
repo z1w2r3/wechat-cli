@@ -437,13 +437,24 @@ def _resolve_media_path_legacy(wechat_base, content, base_type, create_time_ts, 
 
         sub_dir_name = "Img" if base_type == 3 else ("Video" if base_type == 43 else "Voice")
 
+        # temp/ImageUtils/ 下有微信解码好的 jpg（hash 和 dat 文件名一致）
+        image_utils_dir = os.path.join(wechat_base, "temp", "ImageUtils")
+
         for d in search_dirs:
             sub = os.path.join(attach_dir, d, date_prefix, sub_dir_name)
             if os.path.isdir(sub):
-                files = [f for f in os.listdir(sub) if not f.endswith("_h.dat")]
+                files = [f for f in os.listdir(sub) if not f.endswith("_h.dat") and not f.endswith("_t.dat")]
+                if not files:
+                    files = [f for f in os.listdir(sub) if not f.endswith("_h.dat")]
                 if files:
-                    sample = files[0]
-                    return os.path.join(sub, sample), True
+                    dat_file = files[0]
+                    # 图片: 优先返回 temp/ImageUtils/ 下的解码 jpg
+                    if base_type == 3 and os.path.isdir(image_utils_dir):
+                        dat_hash = dat_file.replace('.dat', '').replace('_t', '')
+                        jpg_path = os.path.join(image_utils_dir, dat_hash + ".jpg")
+                        if os.path.isfile(jpg_path):
+                            return jpg_path, True
+                    return os.path.join(sub, dat_file), True
 
         if base_type == 43:
             video_dir = os.path.join(msg_dir, "video", date_prefix)
