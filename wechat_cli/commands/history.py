@@ -67,7 +67,7 @@ def history(ctx, chat_name, limit, offset, start_time, end_time, fmt, msg_type, 
         chat_ctx, names, app.display_name_fn,
         start_ts=start_ts, end_ts=end_ts, limit=limit, offset=offset,
         msg_type_filter=type_filter, resolve_media=media, db_dir=app.db_dir,
-        structured=structured_json, decode_voice=decode_voice, cfg=app.cfg,
+        structured=structured_json, decode_voice=decode_voice, cfg=app.cfg, cache=app.cache,
     )
 
     if structured_json:

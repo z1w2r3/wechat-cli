@@ -1,6 +1,7 @@
 """语音消息 silk → wav 转码。"""
 
 import os
+import sqlite3
 import subprocess
 import shutil
 
@@ -11,6 +12,50 @@ def _ensure_audio_dir(cfg):
     audio_dir = os.path.join(state_dir, "audio")
     os.makedirs(audio_dir, exist_ok=True)
     return audio_dir
+
+
+def extract_voice_from_db(local_id, create_time, cache, cfg):
+    """从 media_0.db 的 VoiceInfo 表提取语音数据并转码为 wav。
+
+    Args:
+        local_id: 消息 local_id
+        create_time: 消息时间戳
+        cache: DBCache 实例
+        cfg: 配置 dict
+
+    Returns:
+        (wav_path, warning) 元组
+    """
+    media_path = cache.get("message/media_0.db")
+    if not media_path:
+        return None, "media_0.db 不可用"
+
+    try:
+        conn = sqlite3.connect(media_path)
+        row = conn.execute(
+            "SELECT voice_data FROM VoiceInfo WHERE local_id=? AND create_time=?",
+            (local_id, create_time)
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        return None, f"查询 VoiceInfo 失败: {e}"
+
+    if not row or not row[0]:
+        return None, None  # 无语音数据，不报错
+
+    voice_data = row[0]
+    audio_dir = _ensure_audio_dir(cfg)
+    silk_path = os.path.join(audio_dir, f"voice_{local_id}_{create_time}.silk")
+    with open(silk_path, 'wb') as f:
+        f.write(voice_data)
+
+    wav_path, warning = decode_silk_to_wav(silk_path, cfg)
+
+    # 清理临时 silk 文件
+    if os.path.isfile(silk_path) and wav_path:
+        os.remove(silk_path)
+
+    return wav_path, warning
 
 
 def _has_ffmpeg():

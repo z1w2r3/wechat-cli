@@ -574,7 +574,7 @@ def _query_messages(conn, table_name, start_ts=None, end_ts=None, keyword='', li
     else:
         sql = f"""
             SELECT local_id, local_type, create_time, real_sender_id, message_content,
-                   WCDB_CT_message_content
+                   WCDB_CT_message_content, packed_info_data
             FROM [{table_name}]
             {where_sql}
             ORDER BY create_time DESC
@@ -693,13 +693,55 @@ def _build_history_line(row, ctx, names, id_to_username, display_name_fn, resolv
     return create_time, f'[{time_str}] {text}'
 
 
-def _build_history_object(row, ctx, names, id_to_username, display_name_fn, resolve_media=False, db_dir=None, decode_voice=False, cfg=None):
+def _extract_voice_text_from_packed(packed_data):
+    """从旧版 packed_info_data (protobuf) 中提取语音转文字。"""
+    if not packed_data or not isinstance(packed_data, bytes):
+        return None
+    # 遍历 protobuf 字段，提取 UTF-8 文本
+    data = bytes(packed_data)
+    text = None
+    i = 0
+    while i < len(data):
+        if i + 2 < len(data) and (data[i] & 0x07) == 2:  # wire type 2 (length-delimited)
+            i += 1
+            length = data[i]
+            i += 1
+            if i + length <= len(data):
+                chunk = data[i:i + length]
+                try:
+                    decoded = chunk.decode('utf-8')
+                    # 取最长的含中文或有意义的文本
+                    if len(decoded) > 1 and (any(ord(c) > 127 for c in decoded) or (len(decoded) > 5 and decoded.isprintable())):
+                        if text is None or len(decoded) > len(text):
+                            text = decoded
+                except (UnicodeDecodeError, ValueError):
+                    pass
+                i += length
+            else:
+                i += 1
+        else:
+            i += 1
+    return text
+
+
+def _build_history_object(row, ctx, names, id_to_username, display_name_fn, resolve_media=False, db_dir=None, decode_voice=False, cfg=None, cache=None):
     """构建结构化消息 dict，用于 --json 输出。"""
-    # 新版表多一个 msgVoiceText 字段
+    # 新版(7列含 msgVoiceText) 或旧版(7列含 packed_info_data)
     if len(row) >= 7:
-        local_id, local_type, create_time, real_sender_id, content, ct, voice_text = row[:7]
+        local_id, local_type, create_time, real_sender_id, content, ct = row[:6]
+        extra = row[6]
     else:
-        local_id, local_type, create_time, real_sender_id, content, ct = row
+        local_id, local_type, create_time, real_sender_id, content, ct = row[:6]
+        extra = None
+
+    # 提取语音文字
+    if isinstance(extra, str) and extra:
+        # 新版: msgVoiceText 直接是字符串
+        voice_text = extra
+    elif isinstance(extra, bytes) and extra:
+        # 旧版: packed_info_data 是 protobuf
+        voice_text = _extract_voice_text_from_packed(extra)
+    else:
         voice_text = None
     content = decompress_content(content, ct)
     if content is None:
@@ -742,7 +784,7 @@ def _build_history_object(row, ctx, names, id_to_username, display_name_fn, reso
     if resolve_media and db_dir and content:
         media = _build_media_info(
             db_dir, content, local_type, create_time, ctx['username'], local_id,
-            base_type, sub_type, decode_voice, cfg
+            base_type, sub_type, decode_voice, cfg, cache=cache
         )
         if media:
             obj['media'] = media
@@ -750,14 +792,37 @@ def _build_history_object(row, ctx, names, id_to_username, display_name_fn, reso
     return create_time, obj
 
 
-def _build_media_info(db_dir, content, local_type, create_time_ts, chat_username, local_id, base_type, sub_type, decode_voice, cfg):
+def _build_media_info(db_dir, content, local_type, create_time_ts, chat_username, local_id, base_type, sub_type, decode_voice, cfg, cache=None):
     """构建媒体信息 dict。"""
     try:
         media_path, media_exists = _resolve_media_path(
             db_dir, content, local_type, create_time_ts, chat_username, local_id=local_id
         )
     except Exception:
-        return None
+        media_path, media_exists = None, False
+
+    # 语音: 即使没有本地文件也尝试从数据库提取
+    if base_type == 34:
+        media = {'type': 'voice'}
+        if media_path:
+            media['path'] = media_path
+            media['exists'] = media_exists
+            media['original'] = media_path
+        if decode_voice and cfg:
+            from .voice import decode_silk_to_wav, extract_voice_from_db
+            wav_path = None
+            warning = None
+            # 优先从本地文件转码
+            if media_path and media_exists:
+                wav_path, warning = decode_silk_to_wav(media_path, cfg)
+            # 本地没有文件则从 media_0.db 提取
+            if not wav_path and cache:
+                wav_path, warning = extract_voice_from_db(local_id, create_time_ts, cache, cfg)
+            if wav_path:
+                media['decoded'] = wav_path
+            if warning:
+                media['decode_warning'] = warning
+        return media if (media_path or media.get('decoded')) else None
 
     if not media_path:
         return None
@@ -768,18 +833,6 @@ def _build_media_info(db_dir, content, local_type, create_time_ts, chat_username
     if base_type == 3:
         media['type'] = 'image'
 
-    # 语音: 可选转码
-    elif base_type == 34:
-        media['type'] = 'voice'
-        media['original'] = media_path
-        if decode_voice and media_exists and cfg:
-            from .voice import decode_silk_to_wav
-            wav_path, warning = decode_silk_to_wav(media_path, cfg)
-            if wav_path:
-                media['decoded'] = wav_path
-            if warning:
-                media['decode_warning'] = warning
-
     # 视频
     elif base_type == 43:
         media['type'] = 'video'
@@ -787,7 +840,6 @@ def _build_media_info(db_dir, content, local_type, create_time_ts, chat_username
     # 文件
     elif base_type == 49 and sub_type == 6:
         media['type'] = 'file'
-        # 提取原始文件名
         root = _parse_xml_root(content)
         if root is not None:
             appmsg = root.find('.//appmsg')
@@ -823,7 +875,7 @@ def _build_search_entry(row, ctx, names, id_to_username, display_name_fn, resolv
 
 # ---- 聊天记录查询 ----
 
-def collect_chat_history(ctx, names, display_name_fn, start_ts=None, end_ts=None, limit=20, offset=0, msg_type_filter=None, resolve_media=False, db_dir=None, structured=False, decode_voice=False, cfg=None):
+def collect_chat_history(ctx, names, display_name_fn, start_ts=None, end_ts=None, limit=20, offset=0, msg_type_filter=None, resolve_media=False, db_dir=None, structured=False, decode_voice=False, cfg=None, cache=None):
     collected = []
     failures = []
     candidate_limit = _candidate_page_size(limit, offset)
@@ -832,7 +884,7 @@ def collect_chat_history(ctx, names, display_name_fn, start_ts=None, end_ts=None
     builder = _build_history_object if structured else _build_history_line
     builder_kwargs = dict(resolve_media=resolve_media, db_dir=db_dir)
     if structured:
-        builder_kwargs.update(decode_voice=decode_voice, cfg=cfg)
+        builder_kwargs.update(decode_voice=decode_voice, cfg=cfg, cache=cache)
 
     for table_ctx in _iter_table_contexts(ctx):
         try:
